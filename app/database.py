@@ -8,6 +8,15 @@ import sqlite3
 from datetime import datetime, timezone
 
 _IS_SQLITE = CONFIG.DB_URL.startswith("sqlite")
+if _IS_SQLITE:
+    # 新机器 / 新建的挂载卷上数据库父目录可能还不存在，先建出来。
+    # 否则 SQLAlchemy 直接抛 "sqlite3.OperationalError: unable to open database file"，
+    # 容器一起就退，看起来像启动脚本坏了。
+    _db_file = CONFIG.DB_URL[len("sqlite:///"):]
+    if _db_file and _db_file != ":memory:":
+        _db_dir = os.path.dirname(os.path.abspath(_db_file))
+        if _db_dir:
+            os.makedirs(_db_dir, exist_ok=True)
 _connect_args = {}
 if _IS_SQLITE:
     _connect_args = {

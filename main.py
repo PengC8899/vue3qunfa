@@ -104,6 +104,9 @@ app.add_middleware(
 )
 
 templates = Jinja2Templates(directory="templates")
+# 本地开发先跑后端、还没构建前端时 static/ 不存在：
+# 建个空目录让 StaticFiles 不报错直接启动（页面会 404 到构建完成）。
+os.makedirs("static", exist_ok=True)
 app.mount("/static", StaticFiles(directory="static"), name="static")
 
 def _normalize_account_names(accounts) -> list[str]:
