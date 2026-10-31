@@ -1,0 +1,69 @@
+# Python / App
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+env/
+venv/
+.env
+.env.*
+!.env.example
+
+# OS
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Telegram Sessions (SENSITIVE)
+sessions/
+sessions_*/
+*.session
+*.session-journal
+
+# Database
+*.db
+*.db-shm
+*.db-wal
+data/
+data_*/
+data-*/
+sessions-*/
+
+# Security Keys (EXTREMELY SENSITIVE)
+*.pem
+*.key
+*.pub
+id_rsa
+id_rsa.pub
+
+# Docker / Deployment Archives
+*.tar.gz
+docker-compose.override.yml
+
+# Logs
+logs/
+*.log
+
+# Proxy exports (contain live credentials)
+proxy_list_*.txt
+*.proxy.txt
+
+# Frontend build artifacts
+frontend/node_modules/
+frontend/dist/
+static/dist/
+
+# Local debug / tooling scaffolding (NOT for commit/local only)
+.agents/
+.dbg/
+.trae/skills/
+skills/
+skills-lock.json
+data-isolated/
+ui-preview.html
+debug-*.md

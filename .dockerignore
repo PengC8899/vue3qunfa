@@ -1,0 +1,16 @@
+venv/
+__pycache__/
+.pytest_cache/
+.git/
+.DS_Store
+*.session
+*.pyc
+data.db
+data/
+node_modules/
+frontend/dist/
+static/dist/
+sessions/
+sessions_*/
+sessions-*/
+data-*/

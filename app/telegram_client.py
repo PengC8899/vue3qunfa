@@ -1,0 +1,1413 @@
+import asyncio
+import re
+from typing import List, Optional
+from telethon import TelegramClient, events
+from telethon.errors import SessionPasswordNeededError, FloodWaitError, PhoneNumberInvalidError
+from telethon.errors import UserNotParticipantError
+from telethon.tl.types import Channel, Chat, User, ChannelParticipantBanned, ChannelParticipantLeft
+from telethon.errors import ChatWriteForbiddenError, UserBannedInChannelError
+from telethon.tl.functions.channels import GetFullChannelRequest
+from telethon.tl.functions.messages import GetFullChatRequest
+from telethon.tl.functions.users import GetFullUserRequest
+from telethon.utils import get_peer_id
+from app.config import CONFIG
+import os
+import tempfile
+import shutil
+import random
+import hashlib
+import socks
+
+from app.database import SessionLocal
+from app.services.proxy_service import get_proxy_binding, get_proxy_enforce
+
+COPY_RECEIVER_ACCOUNT = None
+COPY_RECEIVER_ENABLED = 0
+_ON_PRIVATE_MESSAGE = None
+
+# 消息末尾随机追加的符号 / emoji。
+# 同一条广告反复投到不同群、不同轮次时，每次结尾都不一样，降低被平台判成
+# 「同一条批量消息」的概率。转发链接和内联 bot 两种模式没有可编辑的正文，不受影响。
+_SEND_SUFFIX_POOL = (
+    "🔥", "✅", "✨", "📌", "💡", "🚀", "🎯", "⭐", "⚡", "💯",
+    "👉", "🔔", "📢", "🌐", "💬", "👍", "🆗",
+    "｜", "·", "•", "→", "※", "★", "✳", "❖",
+)
+
+
+def append_send_suffix(text: str) -> str:
+    """发送正文末尾追加一个随机符号；空文本或关闭内容指纹时原样返回。"""
+    if not text:
+        return text
+    if int(getattr(CONFIG, "CONTENT_FINGERPRINT_ENABLED", 1)) == 0:
+        return text
+    suffix = random.choice(_SEND_SUFFIX_POOL)
+    body = text.rstrip()
+    if not body or body.endswith(suffix):
+        return text
+    return f"{body} {suffix}"
+
+
+def _should_retry_with_reconnect(error_text: str | None) -> bool:
+    err = (error_text or "").lower()
+    transient_markers = (
+        "cannot send requests while disconnected",
+        "connection",
+        "timed out",
+        "timeout",
+        "broken pipe",
+        "server closed the connection",
+        "network",
+        "transport",
+        "reset by peer",
+    )
+    return any(marker in err for marker in transient_markers)
+
+def _generate_device_info(session_name: str):
+    """
+    根据 session_name 生成固定的设备指纹信息。
+    保证同一个账号在不同时间启动时，设备指纹保持一致（避免被判定为新设备登录）。
+    """
+    # 使用 session_name 的 hash 作为种子
+    seed_val = int(hashlib.sha256(session_name.encode("utf-8")).hexdigest(), 16)
+    rng = random.Random(seed_val)
+    
+    models = [
+        "Samsung Galaxy S24 Ultra", "Samsung Galaxy S23", "Pixel 8 Pro", "Pixel 7", 
+        "Xiaomi 14", "OnePlus 12", "Huawei Mate 60", "Sony Xperia 1 V",
+        "iPhone 15 Pro Max", "iPhone 14", "iPad Pro 12.9", "iPad Air 5"
+    ]
+    sys_vers = [
+        "Android 14", "Android 13", "Android 12", 
+        "iOS 17.4", "iOS 16.6", "iOS 15.7",
+        "Windows 11", "macOS 14.4"
+    ]
+    app_vers = ["10.8.1", "10.6.2", "9.5.4", "8.9.1", "4.16.4"]
+    langs = ["en", "en", "zh-cn", "es", "ru"]
+    
+    return {
+        "device_model": rng.choice(models),
+        "system_version": rng.choice(sys_vers),
+        "app_version": rng.choice(app_vers),
+        "lang_code": rng.choice(langs),
+        "system_lang_code": rng.choice(langs),
+    }
+
+def set_copy_receiver(account: Optional[str], enabled: bool):
+    global COPY_RECEIVER_ACCOUNT, COPY_RECEIVER_ENABLED
+    COPY_RECEIVER_ACCOUNT = account
+    COPY_RECEIVER_ENABLED = 1 if enabled else 0
+
+def set_on_private_message(cb):
+    global _ON_PRIVATE_MESSAGE
+    _ON_PRIVATE_MESSAGE = cb
+
+
+def _looks_like_postbot_code(value: str) -> bool:
+    raw = (value or "").strip()
+    if not raw or " " in raw or len(raw) < 10 or len(raw) > 128:
+        return False
+    if not re.fullmatch(r"[A-Za-z0-9_-]+", raw):
+        return False
+    return bool(re.search(r"\d", raw))
+
+
+def _extract_inline_bot_query(text: str) -> tuple[Optional[str], Optional[str]]:
+    raw = (text or "").strip()
+    if not raw:
+        return None, None
+
+    inline_match = re.match(r"^@([A-Za-z0-9_]{5,32})\s+(.+)$", raw)
+    if inline_match:
+        bot_username = inline_match.group(1)
+        query = inline_match.group(2).strip()
+        return (bot_username, query) if query else (None, None)
+
+    prefix_match = re.match(r"^(postbot)\s*[:\s]\s*(.+)$", raw, flags=re.IGNORECASE)
+    if prefix_match:
+        query = prefix_match.group(2).strip()
+        return (INLINE_BOT_USERNAME, query) if query else (None, None)
+
+    deep_link_match = re.search(
+        r"(?:https?://)?t\.me/(PostBot)(?:/)?\?start=([A-Za-z0-9_-]{6,128})",
+        raw,
+        flags=re.IGNORECASE,
+    )
+    if deep_link_match:
+        return deep_link_match.group(1), deep_link_match.group(2)
+
+    if _looks_like_postbot_code(raw):
+        return INLINE_BOT_USERNAME, raw
+
+    return None, None
+
+
+# 群不让转发这类内容时 Telegram 报的错。撞上它不该把整条消息判死：
+# 退回去把链接当纯文本发，通常还能过。
+_FORWARD_BLOCKED_RE = re.compile(
+    r"cannot send .*results in this chat|chat_forwards_restricted",
+    re.IGNORECASE,
+)
+
+
+def _chat_blocks_forwards(error_text: Optional[str]) -> bool:
+    return bool(error_text) and bool(_FORWARD_BLOCKED_RE.search(str(error_text)))
+
+
+def _extract_forward_source(text: str) -> tuple[Optional[object], Optional[int]]:
+    raw = (text or "").strip()
+    if not raw:
+        return None, None
+
+    private_match = re.match(
+        r"^(?:https?://)?t\.me/c/(\d+)/(\d+)(?:\?.*)?$",
+        raw,
+        flags=re.IGNORECASE,
+    )
+    if private_match:
+        internal_id = private_match.group(1)
+        message_id = int(private_match.group(2))
+        return int(f"-100{internal_id}"), message_id
+
+    public_match = re.match(
+        r"^(?:https?://)?t\.me/(?:s/)?([A-Za-z0-9_]{5,32})/(\d+)(?:\?.*)?$",
+        raw,
+        flags=re.IGNORECASE,
+    )
+    if public_match:
+        return public_match.group(1), int(public_match.group(2))
+
+    return None, None
+
+INLINE_BOT_USERNAME = "PostBot"
+INLINE_BOT_QUERY = "694014ffc3b8e"
+
+# Old text fallback (kept for reference, can be removed)
+# AUTO_REPLY_TEXT = ... 
+
+class AccountClientManager:
+    def __init__(self, session_name: str, api_id: int = None, api_hash: str = None):
+        self.session_name = session_name
+        
+        # 如果初始化未提供 api_id/hash，则从配置中随机选择一个
+        if api_id is None or api_hash is None:
+            if CONFIG.TG_API_KEYS:
+                # 基于 session_name 的 hash 来选择 api key，保证同一个 session 总是使用同一个 api key
+                # 这样可以避免频繁更换 api key 导致的风控
+                seed_val = int(hashlib.sha256(session_name.encode("utf-8")).hexdigest(), 16)
+                key_idx = seed_val % len(CONFIG.TG_API_KEYS)
+                creds = CONFIG.TG_API_KEYS[key_idx]
+                self.api_id = int(creds["api_id"])
+                self.api_hash = creds["api_hash"]
+            else:
+                # Fallback (should not happen if config is correct)
+                self.api_id = CONFIG.TG_API_ID
+                self.api_hash = CONFIG.TG_API_HASH
+        else:
+            self.api_id = api_id
+            self.api_hash = api_hash
+            
+        self.client: Optional[TelegramClient] = None
+        self._connected = False
+        self._auto_reply_setup = False
+        self._last_activity = 0  # 最后活动时间
+        self._lock = asyncio.Lock()  # 连接锁
+        self._started_inline_bots: set[str] = set()
+        self._group_title_cache: dict[int, str] = {}
+
+    def _load_proxy(self):
+        with SessionLocal() as db:
+            binding = get_proxy_binding(db, self.session_name)
+            if not binding or not int(binding.enabled or 0):
+                return None
+            proxy_type = (binding.proxy_type or "socks5").strip().lower()
+            proxy_kind = socks.SOCKS5 if proxy_type == "socks5" else socks.HTTP
+            return (
+                proxy_kind,
+                binding.host,
+                int(binding.port),
+                True,
+                binding.username or None,
+                binding.password or None,
+            )
+
+    def assert_proxy_policy(self):
+        """开着「强制一账号一代理」时，没有绑定代理的账号一律不许连 Telegram。
+
+        8002/8004 的教训：100 个新号没配代理、全部从同一个出口 IP 连出去，
+        几分钟内被 Telegram 注销了 78 个 auth key。连之前先拦住，比连上去掉号好。
+        """
+        with SessionLocal() as db:
+            if not get_proxy_enforce(db):
+                return
+            binding = get_proxy_binding(db, self.session_name)
+            if binding and int(binding.enabled or 0):
+                return
+        raise RuntimeError(
+            f"账号 {self.session_name} 没有绑定可用代理，已按「强制一账号一代理」拒绝连接"
+            f"（到「代理 IP 配置」给它绑定代理，或关掉该开关）"
+        )
+
+    def _build_client(self, session_base: str, loop, use_device_fingerprint: bool = True):
+        kwargs = {
+            "loop": loop,
+            "proxy": self._load_proxy(),
+        }
+        if use_device_fingerprint:
+            device_params = _generate_device_info(self.session_name)
+            kwargs.update(
+                {
+                    "device_model": device_params["device_model"],
+                    "system_version": device_params["system_version"],
+                    "app_version": device_params["app_version"],
+                    "lang_code": device_params["lang_code"],
+                    "system_lang_code": device_params["system_lang_code"],
+                }
+            )
+        return TelegramClient(session_base, self.api_id, self.api_hash, **kwargs)
+
+    async def reset_client(self):
+        async with self._lock:
+            if self.client:
+                try:
+                    await self.client.disconnect()
+                except Exception:
+                    pass
+            self.client = None
+            self._connected = False
+            self._auto_reply_setup = False
+
+    async def reconnect(self):
+        await self.reset_client()
+        await self.ensure_connected()
+
+    async def ensure_connected(self):
+        async with self._lock:
+            if not self._connected or (self.client and not self.client.is_connected()):
+                # 只在真要发起连接时才查代理策略：连上以后这里是热路径（每条消息都走），
+                # 不能每次都去查库。
+                self.assert_proxy_policy()
+                loop = asyncio.get_running_loop()
+                if self.client is None:
+                    session_base = os.path.join(CONFIG.SESSION_DIR, self.session_name)
+                    self.client = self._build_client(session_base, loop, use_device_fingerprint=True)
+                if not self.client.is_connected():
+                    try:
+                        await self.client.connect()
+                    except Exception:
+                        raise
+                authorized = await self.client.is_user_authorized()
+                if not authorized:
+                    raise RuntimeError("Telegram session not authorized")
+                self._connected = True
+                self._setup_auto_reply()
+            import time
+            self._last_activity = time.time()
+
+    async def disconnect(self):
+        """断开连接以释放资源"""
+        async with self._lock:
+            if self.client and self.client.is_connected():
+                try:
+                    await self.client.disconnect()
+                except Exception:
+                    pass
+            self._connected = False
+            print(f"[CONN] {self.session_name}: disconnected to save memory")
+
+    def _setup_auto_reply(self):
+        if self._auto_reply_setup or not self.client:
+            return
+        
+        # Check environment variable to enable/disable auto-reply
+        # Default is True ("true", "1", "yes" all count as True)
+        enable_auto_reply = os.getenv("ENABLE_AUTO_REPLY", "true").lower() in ("true", "1", "yes")
+        
+        if not enable_auto_reply:
+            print(f"[INFO] Auto-reply DISABLED for account {self.session_name} (ENABLE_AUTO_REPLY={os.getenv('ENABLE_AUTO_REPLY')})")
+            self._auto_reply_setup = True
+            return
+
+        @self.client.on(events.NewMessage(incoming=True, func=lambda e: e.is_private))
+        async def handler(event):
+            try:
+                if event.sender_id == (await self.client.get_me()).id:
+                    return
+                if COPY_RECEIVER_ENABLED and COPY_RECEIVER_ACCOUNT and self.session_name == COPY_RECEIVER_ACCOUNT and _ON_PRIVATE_MESSAGE:
+                    try:
+                        asyncio.create_task(_ON_PRIVATE_MESSAGE(self.session_name, event))
+                    except Exception:
+                        pass
+                default_reply = """🚀 URGENT: High-Volume Corporate Account
+💵High commissions & fast settlement
+
+Required Accounts:
+
+✔️CBI CORPORATE
+✔️AU CORPORATE
+✔️BANDHAN CORPORATE
+✔️YES BUSINESS
+✔️KOTAK (CMS⚡️)
+✔️SARASWAT CORPORATE
+✔️HDFC (DOMAIN 2ID⚡️)
+✔️DBS
+
+F2F
+📍Mount abu
+📍Lucknow
+📍Delhi
+📍Mumbai
+📍Chandigarh
+📍Palanpur
+📍Bangalore
+📍Goa
+📍Indore
+📍Gualiur
+
+📥 DM for Details. Let's work!
+@shiqi123890
+@HY_aidisheng
+@hyhya
+@akaka"""
+                reply_text = os.getenv("AUTO_REPLY_TEXT", default_reply)
+                if reply_text is None:
+                    reply_text = default_reply
+                reply_text = reply_text.replace("\\n", "\n")
+                await event.reply(reply_text, parse_mode=None, link_preview=False)
+                print(f"[INFO] Auto-replied '{reply_text}' to {event.sender_id} on account {self.session_name}")
+            except Exception as e:
+                print(f"[ERROR] Auto-reply failed: {e}")
+
+        self._auto_reply_setup = True
+        print(f"[INFO] Auto-reply setup for account {self.session_name}")
+
+    async def _ensure_client(self):
+        self.assert_proxy_policy()
+        loop = asyncio.get_running_loop()
+        if self.client is None:
+            session_base = os.path.join(CONFIG.SESSION_DIR, self.session_name)
+            self.client = self._build_client(session_base, loop, use_device_fingerprint=True)
+        await self.client.connect()
+        try:
+            authorized = await self.client.is_user_authorized()
+        except Exception:
+            authorized = False
+        if authorized:
+            self._connected = True
+            self._setup_auto_reply()
+
+    async def send_login_code(self, phone: str, force_sms: bool = False, force_new_session: bool = False):
+        """
+        发送登录验证码
+        
+        Args:
+            phone: 手机号（带国家码）
+            force_sms: 强制使用短信验证
+            force_new_session: 强制创建新会话（删除现有session文件）
+        """
+        print(f"[DEBUG] send_login_code called for {phone} session {self.session_name}")
+        loop = asyncio.get_running_loop()
+        
+        session_base = os.path.join(CONFIG.SESSION_DIR, self.session_name)
+        
+        # 1. 关闭现有连接
+        if self.client:
+            await self.reset_client()
+        
+        # 2. 检查是否需要删除现有 session
+        # 只有在明确要求或者 session 文件损坏时才删除
+        session_path = f"{session_base}.session"
+        if force_new_session:
+            print(f"[DEBUG] Force new session requested, deleting existing session...")
+            for p in [session_path, f"{session_base}.session-journal"]:
+                try:
+                    if os.path.exists(p):
+                        os.remove(p)
+                        print(f"[DEBUG] Deleted {p}")
+                except Exception as e:
+                    print(f"[ERROR] Failed to delete {p}: {e}")
+        elif os.path.exists(session_path):
+            # 尝试使用现有 session
+            print(f"[DEBUG] Found existing session file, checking if authorized...")
+            try:
+                temp_client = self._build_client(session_base, loop, use_device_fingerprint=True)
+                await temp_client.connect()
+                if await temp_client.is_user_authorized():
+                    await temp_client.disconnect()
+                    return {"ok": True, "already_authorized": True, "message": "Session already authorized"}
+                await temp_client.disconnect()
+            except Exception as e:
+                print(f"[DEBUG] Existing session check failed: {e}, will try fresh login")
+                # Session 文件可能损坏或 API ID 不匹配，删除后重试
+                for p in [session_path, f"{session_base}.session-journal"]:
+                    try:
+                        if os.path.exists(p):
+                            os.remove(p)
+                            print(f"[DEBUG] Deleted corrupted session: {p}")
+                    except Exception as del_err:
+                        print(f"[ERROR] Failed to delete {p}: {del_err}")
+
+        # 3. 创建新客户端
+        self.client = self._build_client(session_base, loop, use_device_fingerprint=True)
+        await self.client.connect()
+        
+        try:
+            print(f"[DEBUG] Sending code request to {phone}")
+            resp = await self.client.send_code_request(phone, force_sms=force_sms)
+            print(f"[DEBUG] Send code response: {resp}")
+            
+            # Explicitly check for SentCode type
+            from telethon.tl.types import auth
+            code_type = "unknown"
+            
+            if isinstance(resp, auth.SentCode):
+                t_name = type(resp.type).__name__
+                print(f"[DEBUG] Code type name: {t_name}")
+                if "App" in t_name:
+                    code_type = "app"
+                elif "Sms" in t_name:
+                    code_type = "sms"
+                elif "Call" in t_name:
+                    code_type = "call"
+                elif "FlashCall" in t_name:
+                    code_type = "flash_call"
+                    
+            return {"ok": True, "type": code_type, "debug_info": str(resp)}
+        except FloodWaitError as e:
+            print(f"[ERROR] FloodWaitError: {e}")
+            return {"ok": False, "retry_after": getattr(e, "seconds", 60)}
+        except PhoneNumberInvalidError:
+            print(f"[ERROR] PhoneNumberInvalidError for {phone}")
+            return {"ok": False, "error": "phone_invalid"}
+        except Exception as e:
+            print(f"[ERROR] Generic Exception during send_code: {type(e).__name__}: {e}")
+            return {"ok": False, "error": str(e)}
+
+    async def confirm_login(self, phone: str, code: str, password: str | None = None):
+        await self._ensure_client()
+        try:
+            await self.client.sign_in(phone=phone, code=code)
+        except SessionPasswordNeededError:
+            if not password:
+                raise
+            await self.client.sign_in(password=password)
+        me = await self.client.get_me()
+        self._connected = True
+        self._setup_auto_reply()
+        return {"id": getattr(me, "id", None)}
+
+    async def is_authorized(self) -> bool:
+        await self._ensure_client()
+        return await self.client.is_user_authorized()
+
+    async def validate_session(self) -> dict:
+        """
+        验证 session 文件是否有效，不会删除 session
+        返回: {"valid": bool, "authorized": bool, "user_id": int|None, "phone": str|None, "error": str|None}
+        """
+        session_base = os.path.join(CONFIG.SESSION_DIR, self.session_name)
+        session_path = f"{session_base}.session"
+        
+        if not os.path.exists(session_path):
+            return {"valid": False, "authorized": False, "error": "session_file_not_found"}
+        try:
+            with open(session_path, "rb") as f:
+                header = f.read(16)
+            if not header.startswith(b"SQLite format 3"):
+                return {"valid": False, "authorized": False, "error": "invalid_session_file_format"}
+        except Exception as e:
+            return {"valid": False, "authorized": False, "error": f"session_read_failed: {type(e).__name__}: {str(e)}"}
+        
+        loop = asyncio.get_running_loop()
+        temp_client = None
+        temp_dir = None
+        try:
+            temp_dir = tempfile.mkdtemp(prefix="tg_session_validate_")
+            temp_session_base = os.path.join(temp_dir, self.session_name)
+            shutil.copy2(session_path, f"{temp_session_base}.session")
+            journal_src = f"{session_path}-journal"
+            if os.path.exists(journal_src):
+                shutil.copy2(journal_src, f"{temp_session_base}.session-journal")
+
+            temp_client = self._build_client(temp_session_base, loop, use_device_fingerprint=False)
+            await temp_client.connect()
+            
+            if not await temp_client.is_user_authorized():
+                return {"valid": True, "authorized": False, "error": "not_authorized"}
+            
+            me = await temp_client.get_me()
+            return {
+                "valid": True,
+                "authorized": True,
+                "user_id": me.id if me else None,
+                "phone": me.phone if me else None,
+                "first_name": getattr(me, 'first_name', None),
+                "username": getattr(me, 'username', None),
+            }
+        except Exception as e:
+            error_type = type(e).__name__
+            return {"valid": False, "authorized": False, "error": f"{error_type}: {str(e)}"}
+        finally:
+            if temp_client:
+                try:
+                    await temp_client.disconnect()
+                except Exception:
+                    pass
+            if temp_dir:
+                try:
+                    shutil.rmtree(temp_dir, ignore_errors=True)
+                except Exception:
+                    pass
+
+    async def get_joined_groups(self, only_groups: bool = True) -> List[dict]:
+        await self._ensure_client()
+        ok = await self.client.is_user_authorized()
+        if not ok:
+            return []
+        await self.ensure_connected()
+        try:
+            dialogs = await self.client.get_dialogs()
+        except Exception:
+            raise
+        result: List[dict] = []
+        for d in dialogs:
+            e = d.entity
+            if isinstance(e, Chat):
+                member_count = None
+                if getattr(CONFIG, "GROUP_MEMBER_COUNT_ENABLED", 0):
+                    try:
+                        full = await self.client(GetFullChatRequest(e.id))
+                        member_count = getattr(full.full_chat, "participants_count", None)
+                    except Exception:
+                        member_count = None
+                result.append({
+                    "id": get_peer_id(e),
+                    "raw_id": e.id,
+                    "title": d.name,
+                    "username": None,
+                    "is_megagroup": False,
+                    "is_channel": False,
+                    "member_count": member_count,
+                })
+            elif isinstance(e, Channel):
+                is_megagroup = bool(getattr(e, "megagroup", False))
+                is_broadcast = bool(getattr(e, "broadcast", False))
+                if only_groups and not is_megagroup:
+                    continue
+                member_count = None
+                if getattr(CONFIG, "GROUP_MEMBER_COUNT_ENABLED", 0):
+                    try:
+                        full = await self.client(GetFullChannelRequest(e))
+                        member_count = getattr(full.full_chat, "participants_count", None)
+                    except Exception:
+                        member_count = None
+                result.append({
+                    "id": get_peer_id(e),
+                    "raw_id": e.id,
+                    "title": d.name,
+                    "username": getattr(e, "username", None),
+                    "is_megagroup": is_megagroup,
+                    "is_channel": (not is_megagroup) or is_broadcast,
+                    "member_count": member_count,
+                })
+        return result
+
+    async def inspect_group_send_capability(self) -> dict:
+        """检查账号是否至少能在一个已加入群里发送文字消息。"""
+        await self._ensure_client()
+        if not await self.client.is_user_authorized():
+            return {
+                "can_send_in_groups": False,
+                "sendable_groups": 0,
+                "checked_groups": 0,
+                "detail": "账号未授权",
+            }
+
+        await self.ensure_connected()
+        dialogs = await self.client.get_dialogs(limit=None)
+        me = await self.client.get_me()
+        checked_groups = 0
+        blocked_groups = 0
+        last_block_reason = None
+
+        for dialog in dialogs:
+            entity = dialog.entity
+            is_group = isinstance(entity, Chat) or (
+                isinstance(entity, Channel) and bool(getattr(entity, "megagroup", False))
+            )
+            if not is_group:
+                continue
+
+            checked_groups += 1
+            # 群默认只允许管理员发言：这个号在里面永远发不出去
+            if bool(getattr(getattr(entity, "default_banned_rights", None), "send_messages", False)):
+                blocked_groups += 1
+                last_block_reason = "group_readonly"
+                continue
+            try:
+                permissions = await self.client.get_permissions(entity, me)
+                # ParticipantPermissions 没有 send_messages 属性，禁言要看 participant 上的
+                # banned_rights；以前读不存在的属性恒为 None，所有账号都被判成「能发」。
+                part = getattr(permissions, "participant", None)
+                rights = getattr(part, "banned_rights", None)
+                if isinstance(part, ChannelParticipantBanned) and (
+                    bool(getattr(part, "left", False))
+                    or bool(getattr(rights, "view_messages", False))
+                    or bool(getattr(rights, "send_messages", False))
+                ):
+                    blocked_groups += 1
+                    last_block_reason = "chat_write_forbidden"
+                    continue
+                return {
+                    "can_send_in_groups": True,
+                    "sendable_groups": 1,
+                    "checked_groups": checked_groups,
+                    "group_id": int(get_peer_id(entity)),
+                    "group_title": getattr(entity, "title", None) or dialog.name,
+                    "detail": f"可在群 {getattr(entity, 'title', None) or dialog.name} 发消息",
+                }
+            except ChatWriteForbiddenError:
+                blocked_groups += 1
+                last_block_reason = "chat_write_forbidden"
+            except UserBannedInChannelError:
+                blocked_groups += 1
+                last_block_reason = "user_banned_in_channel"
+            except Exception as exc:
+                err_text = str(exc).lower()
+                if "chat_write_forbidden" in err_text or "banned from sending messages" in err_text:
+                    blocked_groups += 1
+                    last_block_reason = str(exc)[:80]
+                    continue
+                # 无法稳定读取权限时，不把账号直接判死，继续检查下一个群。
+                last_block_reason = str(exc)[:80]
+
+        if checked_groups == 0:
+            return {
+                "can_send_in_groups": False,
+                "sendable_groups": 0,
+                "checked_groups": 0,
+                "detail": "未加入任何可检测群组",
+            }
+
+        detail = f"已检查 {checked_groups} 个群，均无法发送消息"
+        if last_block_reason:
+            detail = f"{detail}（最近原因: {last_block_reason}）"
+        return {
+            "can_send_in_groups": False,
+            "sendable_groups": 0,
+            "checked_groups": checked_groups,
+            "blocked_groups": blocked_groups,
+            "detail": detail,
+        }
+
+    async def _resolve_entity_from_dialogs(self, target_group_id: int):
+        dialogs = await self.client.get_dialogs(limit=None)
+        for d in dialogs:
+            e = d.entity
+            try:
+                if int(get_peer_id(e)) == int(target_group_id):
+                    return e
+            except Exception:
+                pass
+            try:
+                if int(getattr(e, "id", 0)) == int(target_group_id):
+                    return e
+            except Exception:
+                pass
+        raise ValueError("entity_not_found_in_dialogs")
+
+    async def _resolve_group_entity(self, group_id: int):
+        try:
+            ent = await self.client.get_entity(group_id)
+        except Exception as e:
+            try:
+                ent = await self._resolve_entity_from_dialogs(group_id)
+            except Exception:
+                raise e
+        return ent
+
+    async def resolve_group_ref(self, ref) -> dict:
+        """把 @username / t.me 链接 / 数字 id 解析成实体。目标群组池落库数字 id 用。"""
+        value = ref
+        if isinstance(ref, str):
+            text = ref.strip()
+            if "t.me/" in text:
+                text = text.split("t.me/", 1)[1].split("?", 1)[0].strip("/")
+                if text.lower().startswith("joinchat/"):
+                    text = "https://t.me/+" + text.split("/", 1)[1]
+            value = text
+            if re.fullmatch(r"-?\d{5,}", text):
+                value = int(text)
+        await self.ensure_connected()
+        ent = await self._resolve_group_entity(value)
+        if isinstance(ent, User):
+            return {"ok": False, "error": "peer_is_user"}
+        return {
+            "ok": True,
+            "id": get_peer_id(ent),
+            "title": getattr(ent, "title", None) or getattr(ent, "username", None),
+            "username": getattr(ent, "username", None),
+            "broadcast": bool(getattr(ent, "broadcast", False)),
+        }
+
+    async def get_group_title(self, group_id: int) -> str:
+        gid = int(group_id)
+        cached = self._group_title_cache.get(gid)
+        if cached:
+            return cached
+        try:
+            await self.ensure_connected()
+            ent = await self._resolve_group_entity(gid)
+            title = getattr(ent, "title", None) or getattr(ent, "username", None) or getattr(ent, "first_name", None) or str(gid)
+        except Exception:
+            title = str(gid)
+        self._group_title_cache[gid] = title
+        return title
+
+    async def get_send_permission(self, group_id: int) -> str:
+        """这个账号在这个群还能不能发言：ok / blocked / not_member / unknown。
+
+        Telegram 的「禁言」就是一条 send_messages 受限的参与记录，所以只读查一次
+        比真发一条去撞便宜，也不会在群里留下消息、再让管理员看到一次刷屏。
+        """
+        try:
+            await self.ensure_connected()
+            ent = await self._resolve_group_entity(int(group_id))
+        except Exception:
+            return "unknown"
+        if isinstance(ent, User):
+            return "blocked"
+        # 群本身默认就不让普通成员发言（只允许管理员）：换哪个账号都一样
+        if bool(getattr(getattr(ent, "default_banned_rights", None), "send_messages", False)):
+            return "group_readonly"
+        try:
+            me = await self.client.get_me()
+            permissions = await self.client.get_permissions(ent, me)
+        except UserNotParticipantError:
+            return "not_member"
+        except (ChatWriteForbiddenError, UserBannedInChannelError):
+            return "blocked"
+        except Exception as exc:
+            text = str(exc).lower()
+            if "not a participant" in text or "user_not_participant" in text:
+                return "not_member"
+            if "channel specified is private" in text or "channel_private" in text:
+                return "not_member"
+            return "unknown"
+        part = getattr(permissions, "participant", None)
+        if isinstance(part, ChannelParticipantLeft):
+            return "not_member"
+        if isinstance(part, ChannelParticipantBanned):
+            rights = getattr(part, "banned_rights", None)
+            if bool(getattr(part, "left", False)) or bool(getattr(rights, "view_messages", False)):
+                return "not_member"
+            if bool(getattr(rights, "send_messages", False)):
+                return "blocked"
+        return "ok"
+
+    async def ensure_inline_bot_ready(self, bot_username: str) -> None:
+        await self.ensure_connected()
+        normalized = (bot_username or "").lstrip("@").strip()
+        if not normalized:
+            return
+        cache_key = normalized.lower()
+        if cache_key in self._started_inline_bots:
+            return
+
+        try:
+            dialogs = await self.client.get_dialogs(limit=200)
+            for dialog in dialogs:
+                username = getattr(dialog.entity, "username", None)
+                if username and username.lower() == cache_key:
+                    self._started_inline_bots.add(cache_key)
+                    return
+        except Exception:
+            pass
+
+        try:
+            bot_entity = await self.client.get_entity(normalized)
+            await self.client.send_message(bot_entity, "/start")
+        except Exception as e:
+            # 不阻断后续 inline 查询；有些账号已经 start 过，或者 bot 侧会拒绝重复 start。
+            print(f"[WARN] Failed to warm up inline bot @{normalized} for {self.session_name}: {e}")
+        finally:
+            self._started_inline_bots.add(cache_key)
+
+    async def _resolve_source_entity(self, source_peer: object):
+        if isinstance(source_peer, str):
+            return await self.client.get_entity(source_peer)
+        if isinstance(source_peer, int):
+            return await self._resolve_group_entity(source_peer)
+        raise ValueError("unsupported_source_peer")
+
+    async def ensure_forward_source_ready(self, source_peer: object) -> object:
+        await self.ensure_connected()
+        entity = await self._resolve_source_entity(source_peer)
+        if isinstance(entity, Channel):
+            try:
+                from telethon.tl.functions.channels import JoinChannelRequest
+                await self.client(JoinChannelRequest(entity))
+            except Exception:
+                # 已加入、私有频道或不允许加入都不在这里阻断；
+                # 真实可用性由后续 get_messages/forward_messages 决定。
+                pass
+        return entity
+
+    async def forward_message_link_to_group(
+        self,
+        group_id: int,
+        source_peer: object,
+        source_message_id: int,
+    ) -> tuple[bool, Optional[str], Optional[int]]:
+        await self.ensure_connected()
+
+        try:
+            target_ent = await self._resolve_group_entity(group_id)
+        except Exception as e:
+            return False, str(e), None
+        if isinstance(target_ent, User):
+            return False, "peer_is_user", None
+
+        try:
+            source_ent = await self.ensure_forward_source_ready(source_peer)
+        except Exception as e:
+            return False, f"forward_source_unavailable: {e}", None
+
+        try:
+            src_msg = await self.client.get_messages(source_ent, ids=source_message_id)
+            if not src_msg:
+                return False, "forward_source_message_not_found", None
+        except Exception as e:
+            return False, f"forward_source_fetch_failed: {e}", None
+
+        try:
+            forwarded = await self.client.forward_messages(
+                entity=target_ent,
+                messages=[source_message_id],
+                from_peer=source_ent,
+            )
+            if isinstance(forwarded, list):
+                forwarded = forwarded[0] if forwarded else None
+            mid = getattr(forwarded, "id", None) if forwarded else None
+            return True, None, mid
+        except ChatWriteForbiddenError as exc:
+            return False, f"chat_write_forbidden: {exc}", None
+        except UserBannedInChannelError as exc:
+            return False, f"user_banned_in_channel: {exc}", None
+        except Exception as e:
+            return False, f"forward_send_failed: {e}", None
+
+    async def send_inline_message_to_group(
+        self,
+        group_id: int,
+        query: str,
+        bot_username: str = INLINE_BOT_USERNAME,
+    ) -> tuple[bool, Optional[str], Optional[int]]:
+        await self.ensure_connected()
+
+        try:
+            ent = await self._resolve_group_entity(group_id)
+        except Exception as e:
+            return False, str(e), None
+        if isinstance(ent, User):
+            return False, "peer_is_user", None
+
+        try:
+            await self.ensure_inline_bot_ready(bot_username)
+            results = await self.client.inline_query(bot_username, query, entity=ent)
+            if not results:
+                return False, "inline_no_results", None
+            msg = await results[0].click(entity=ent, hide_via=True)
+            mid = getattr(msg, "id", None)
+            return True, None, mid
+        except ChatWriteForbiddenError as exc:
+            return False, f"chat_write_forbidden: {exc}", None
+        except UserBannedInChannelError as exc:
+            return False, f"user_banned_in_channel: {exc}", None
+        except Exception as e:
+            return False, f"inline_send_failed: {e}", None
+
+    async def send_message_to_group(
+        self,
+        group_id: int,
+        text: str,
+        parse_mode: Optional[str],
+        disable_web_page_preview: bool,
+    ) -> tuple[bool, Optional[str], Optional[int]]:
+        await self.ensure_connected()
+
+        source_peer, source_message_id = _extract_forward_source(text)
+        if source_peer is not None and source_message_id is not None:
+            ok, err, mid = await self.forward_message_link_to_group(
+                group_id=group_id,
+                source_peer=source_peer,
+                source_message_id=source_message_id,
+            )
+            if ok or not _chat_blocks_forwards(err):
+                return ok, err, mid
+            # 群不让转发：不把整条判死，接着往下走，把链接当纯文本发出去
+            print(f"[SEND] 群 {group_id} 不允许转发（{str(err)[:60]}），改为发送链接文本")
+
+        bot_username, inline_query = _extract_inline_bot_query(text)
+        if bot_username and inline_query:
+            return await self.send_inline_message_to_group(
+                group_id=group_id,
+                query=inline_query,
+                bot_username=bot_username,
+            )
+
+        # 纯文本发送：正文末尾补一个随机符号/emoji，同一条文案每次发出去都不一样。
+        # 放在转发/内联分支之后，才不会破坏转发链接和 bot 查询的格式。
+        text = append_send_suffix(text)
+
+        try:
+            ent = await self._resolve_group_entity(group_id)
+        except Exception as e:
+            return False, str(e), None
+        if isinstance(ent, User):
+            return False, "peer_is_user", None
+        pm = None
+        if parse_mode == "markdown":
+            pm = "markdown"
+        elif parse_mode == "html":
+            pm = "html"
+        async def _do_send(entity):
+            return await self.client.send_message(
+                entity=entity,
+                message=text,
+                parse_mode=pm,
+                link_preview=not disable_web_page_preview,
+            )
+
+        try:
+            msg = await _do_send(ent)
+            mid = getattr(msg, 'id', None)
+            return True, None, mid
+        except ChatWriteForbiddenError as exc:
+            return False, f"chat_write_forbidden: {exc}", None
+        except UserBannedInChannelError as exc:
+            return False, f"user_banned_in_channel: {exc}", None
+        except Exception as e:
+            if _should_retry_with_reconnect(str(e)):
+                try:
+                    print(f"[WARN] Connection issue on {self.session_name}, reconnecting before retry: {e}")
+                    await self.reconnect()
+                    ent = await self._resolve_group_entity(group_id)
+                    msg = await _do_send(ent)
+                    mid = getattr(msg, 'id', None)
+                    return True, None, mid
+                except Exception as retry_err:
+                    return False, f"reconnect_retry_failed: {retry_err}", None
+
+            # Handle "Invalid Peer" or "Could not find input entity"
+            # This happens when the entity is not in the local cache/session file
+            err_str = str(e).lower()
+            if "invalid peer" in err_str or "could not find the input entity" in err_str or "peer" in err_str:
+                try:
+                    print(f"[WARN] Peer {group_id} not found in cache or invalid, trying explicit get_entity...")
+                    # Force fetch entity from server
+                    try:
+                        entity = await self.client.get_entity(group_id)
+                    except Exception:
+                        entity = await self._resolve_entity_from_dialogs(group_id)
+                    msg = await _do_send(entity)
+                    mid = getattr(msg, 'id', None)
+                    return True, None, mid
+                except Exception as e2:
+                    # Try refreshing dialogs as a last resort
+                    try:
+                        print(f"[WARN] Peer {group_id} still not found, refreshing dialogs...")
+                        await self.client.get_dialogs(limit=None)
+                        try:
+                            entity = await self.client.get_entity(group_id)
+                        except Exception:
+                            entity = await self._resolve_entity_from_dialogs(group_id)
+                        msg = await _do_send(entity)
+                        mid = getattr(msg, 'id', None)
+                        return True, None, mid
+                    except Exception as e3:
+                        print(f"[ERROR] Failed to resolve/send to peer {group_id} after refresh: {e3}")
+                        return False, f"Peer Error: {str(e)} -> Resolve Failed: {str(e2)} -> Refresh Failed: {str(e3)}", None
+            
+            return False, str(e), None
+
+    async def update_profile(self, first_name: str, last_name: str = "", photo_path: str = None):
+        """
+        更新账号个人资料（名称和头像）
+        """
+        await self.ensure_connected()
+        from telethon.tl.functions.account import UpdateProfileRequest
+        from telethon.tl.functions.photos import UploadProfilePhotoRequest
+        
+        results = {}
+        
+        # 1. 更新名称（仅在提供了 name 时更新，避免 first_name=None 时 Telethon 报错）
+        if first_name:
+            try:
+                await self.client(UpdateProfileRequest(
+                    first_name=first_name,
+                    last_name=last_name
+                ))
+                results["name"] = True
+            except Exception as e:
+                print(f"[ERROR] Failed to update name for {self.session_name}: {e}")
+                results["name"] = False
+                results["name_error"] = str(e)
+        else:
+            results["name"] = "skipped"
+            
+        # 2. 更新头像
+        if photo_path and os.path.exists(photo_path):
+            try:
+                # 某些版本的 Telethon 可以直接传文件路径给 upload_profile_photo
+                # 但更稳妥的是先上传文件
+                file = await self.client.upload_file(photo_path)
+                await self.client(UploadProfilePhotoRequest(fallback=False, file=file))
+                results["photo"] = True
+            except Exception as e:
+                print(f"[ERROR] Failed to update photo for {self.session_name}: {e}")
+                results["photo"] = False
+                results["photo_error"] = str(e)
+        elif photo_path:
+            results["photo"] = False
+            results["photo_error"] = "photo_file_not_found"
+            
+        return results
+
+    async def get_profile(self) -> dict:
+        """
+        获取当前账号的昵称、简介等资料
+        """
+        await self.ensure_connected()
+
+        me = await self.client.get_me()
+        about = None
+        try:
+            full = await self.client(GetFullUserRequest("me"))
+            about = getattr(getattr(full, "full_user", None), "about", None)
+        except Exception as e:
+            print(f"[WARN] Failed to fetch full profile for {self.session_name}: {e}")
+
+        return {
+            "account": self.session_name,
+            "id": getattr(me, "id", None),
+            "first_name": getattr(me, "first_name", "") or "",
+            "last_name": getattr(me, "last_name", "") or "",
+            "nickname": getattr(me, "first_name", "") or "",
+            "username": getattr(me, "username", None),
+            "phone": getattr(me, "phone", None),
+            "about": about or "",
+        }
+
+    async def update_text_profile(self, nickname: str, about: str | None = None):
+        """
+        更新当前账号的昵称与简介，不处理头像。
+        昵称写入 first_name，同时保留现有 last_name，避免影响原有资料。
+        """
+        await self.ensure_connected()
+        from telethon.tl.functions.account import UpdateProfileRequest
+
+        me = await self.client.get_me()
+        req_kwargs = {
+            "first_name": nickname,
+            "last_name": getattr(me, "last_name", "") or "",
+        }
+        if about is not None:
+            req_kwargs["about"] = about
+
+        await self.client(UpdateProfileRequest(**req_kwargs))
+        return await self.get_profile()
+
+    async def join_group(self, invite_link: str, known_joined_ids: set | None = None) -> dict:
+        """
+        通过邀请链接加入群组
+        
+        Args:
+            invite_link: 群组邀请链接 (如 https://t.me/+xxx 或 https://t.me/joinchat/xxx 或 @username)
+            known_joined_ids: 调用方已预取「这个账号已加入的群 id 集合」时传进来，
+                可省掉每个群都拉一次会话列表；为空集合表示确实一个都没加过
+        
+        Returns:
+            {"ok": bool, "group_id": int|None, "title": str|None, "error": str|None}
+        """
+        await self.ensure_connected()
+        
+        try:
+            from telethon.tl.functions.messages import ImportChatInviteRequest, CheckChatInviteRequest
+            from telethon.tl.types import ChatInviteAlready, ChatInvite
+            from telethon.tl.functions.chatlists import CheckChatlistInviteRequest, JoinChatlistInviteRequest
+            from telethon.errors import UserAlreadyParticipantError
+            from telethon import utils
+            import re
+            
+            # 解析邀请链接
+            invite_hash = None
+            username = None
+            folder_slug = None
+            
+            # 处理不同格式的链接
+            addlist_match = re.search(r"(?:https?://)?t\.me/addlist/([A-Za-z0-9_-]+)", invite_link)
+            if addlist_match:
+                folder_slug = addlist_match.group(1)
+            if invite_link.startswith("@"):
+                username = invite_link[1:]
+            elif "t.me/addlist/" in invite_link:
+                folder_slug = invite_link.split("t.me/addlist/")[-1].split("?")[0].split("/")[0]
+            elif "t.me/+" in invite_link:
+                # https://t.me/+xxxxx
+                invite_hash = invite_link.split("+")[-1].split("?")[0]
+            elif "t.me/joinchat/" in invite_link:
+                # https://t.me/joinchat/xxxxx
+                invite_hash = invite_link.split("joinchat/")[-1].split("?")[0]
+            elif "t.me/" in invite_link:
+                # https://t.me/groupname (public group)
+                username = invite_link.split("t.me/")[-1].split("?")[0].split("/")[0]
+            else:
+                # 可能直接是 hash 或 username
+                if re.match(r'^[a-zA-Z][a-zA-Z0-9_]{4,}$', invite_link):
+                    username = invite_link
+                else:
+                    invite_hash = invite_link
+
+            if folder_slug:
+                try:
+                    chatlist = await self.client(CheckChatlistInviteRequest(slug=folder_slug))
+                    raw_peers = []
+                    invite_already = False
+                    if hasattr(chatlist, "peers"):
+                        raw_peers = chatlist.peers
+                    elif hasattr(chatlist, "missing_peers"):
+                        raw_peers = chatlist.missing_peers
+                        invite_already = True
+
+                    chats_by_id = {getattr(c, "id", None): c for c in (getattr(chatlist, "chats", []) or [])}
+
+                    peers_to_join = []
+                    for peer in raw_peers or []:
+                        peer_id = None
+                        if hasattr(peer, "channel_id"):
+                            peer_id = peer.channel_id
+                        elif hasattr(peer, "chat_id"):
+                            peer_id = peer.chat_id
+                        if peer_id is None:
+                            continue
+                        entity = chats_by_id.get(peer_id)
+                        if not entity:
+                            continue
+                        try:
+                            peers_to_join.append(utils.get_input_peer(entity))
+                        except Exception:
+                            continue
+
+                    if not peers_to_join:
+                        if invite_already:
+                            return {"ok": True, "already_joined": True}
+                        return {"ok": False, "error": "folder_empty_or_no_joinable_peers"}
+
+                    chunk_size = 50
+                    joined = 0
+                    for i in range(0, len(peers_to_join), chunk_size):
+                        chunk = peers_to_join[i:i + chunk_size]
+                        await self.client(JoinChatlistInviteRequest(slug=folder_slug, peers=chunk))
+                        joined += len(chunk)
+
+                    return {"ok": True, "joined_count": joined}
+                except Exception as e:
+                    return {"ok": False, "error": f"join_folder_failed: {e}"}
+            
+            if username:
+                # 公开群组，直接通过 username 加入
+                try:
+                    entity = await self.client.get_entity(username)
+                    peer_id = get_peer_id(entity)
+                    if known_joined_ids is not None and peer_id in known_joined_ids:
+                        return {
+                            "ok": True,
+                            "already_joined": True,
+                            "group_id": peer_id,
+                            "title": getattr(entity, 'title', None),
+                        }
+                    if known_joined_ids is None:
+                        # 没预取集合时只能逐个群拉会话列表确认是否已在群里
+                        dialogs = await self.client.get_dialogs()
+                        for d in dialogs:
+                            if hasattr(d.entity, 'id') and get_peer_id(d.entity) == peer_id:
+                                return {
+                                    "ok": True,
+                                    "already_joined": True,
+                                    "group_id": peer_id,
+                                    "title": getattr(entity, 'title', None),
+                                }
+                    
+                    # 加入群组
+                    from telethon.tl.functions.channels import JoinChannelRequest
+                    await self.client(JoinChannelRequest(entity))
+                    return {
+                        "ok": True,
+                        "group_id": peer_id,
+                        "title": getattr(entity, 'title', None),
+                    }
+                except UserAlreadyParticipantError:
+                    # 已在群里：也算成功，绝不重复加。这里必须把 peer id 带回去，
+                    # 否则群组池里「链接已加、id 为空」的群永远进不了发送列表。
+                    return {
+                        "ok": True,
+                        "already_joined": True,
+                        "group_id": get_peer_id(entity) if 'entity' in locals() else None,
+                    }
+                except Exception as e:
+                    return {"ok": False, "error": f"join_public_failed: {e}"}
+            
+            elif invite_hash:
+                # 私有群组，通过邀请链接加入
+                try:
+                    # 先检查邀请链接
+                    result = await self.client(CheckChatInviteRequest(invite_hash))
+                    
+                    if isinstance(result, ChatInviteAlready):
+                        # 已经在群组中
+                        chat = result.chat
+                        return {
+                            "ok": True,
+                            "already_joined": True,
+                            "group_id": get_peer_id(chat),
+                            "title": getattr(chat, 'title', None),
+                        }
+                    elif isinstance(result, ChatInvite):
+                        # 需要加入
+                        updates = await self.client(ImportChatInviteRequest(invite_hash))
+                        # 从 updates 中获取群组信息
+                        chat = None
+                        if hasattr(updates, 'chats') and updates.chats:
+                            chat = updates.chats[0]
+                        return {
+                            "ok": True,
+                            "group_id": get_peer_id(chat) if chat else None,
+                            "title": getattr(chat, 'title', None) if chat else None,
+                        }
+                    else:
+                        return {"ok": False, "error": "unknown_invite_type"}
+                        
+                except Exception as e:
+                    error_str = str(e).lower()
+                    if "userAlreadyParticipant" in str(e):
+                        return {"ok": True, "already_joined": True, "error": None}
+                    elif "invite" in error_str and "expire" in error_str:
+                        return {"ok": False, "error": "invite_expired"}
+                    elif "flood" in error_str:
+                        return {"ok": False, "error": f"flood_wait: {e}"}
+                    else:
+                        return {"ok": False, "error": str(e)}
+            else:
+                return {"ok": False, "error": "invalid_invite_link"}
+                
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+
+
+class MultiTelegramManager:
+    def __init__(self, accounts: dict):
+        self.MAX_CONCURRENT_CONNECTIONS = max(int(getattr(CONFIG, "TELEGRAM_MAX_CONCURRENT_CONNECTIONS", 5)), 1)
+        self.IDLE_TIMEOUT = max(int(getattr(CONFIG, "TELEGRAM_IDLE_TIMEOUT_S", 300)), 30)
+        self.managers: dict[str, AccountClientManager] = {}
+        for name, cfg in accounts.items():
+            self.managers[name] = AccountClientManager(cfg["session_name"], cfg["api_id"], cfg["api_hash"])
+        self._cleanup_task = None
+
+    def get(self, account: str) -> AccountClientManager:
+        if account not in self.managers:
+            # Dynamically create a manager for the account if it doesn't exist.
+            session_name = account
+            
+            # 尝试从全局配置获取，如果获取不到则传递 None，让 AccountClientManager 从 Pool 中选择
+            api_id = int(CONFIG.TG_API_ID) if CONFIG.TG_API_ID is not None else None
+            api_hash = CONFIG.TG_API_HASH
+            
+            # 只有在既没有全局配置也没有 Pool 的情况下才报错
+            if (not api_id or not api_hash) and not CONFIG.TG_API_KEYS:
+                raise RuntimeError("TG_API_ID and TG_API_HASH must be configured in .env, or provide TG_API_KEYS")
+            
+            self.managers[account] = AccountClientManager(session_name, api_id, api_hash)
+        return self.managers[account]
+
+    async def ensure_connected(self, account: str):
+        # 先检查是否需要断开其他空闲连接
+        await self._cleanup_idle_connections()
+        await self.get(account).ensure_connected()
+    
+    async def _cleanup_idle_connections(self):
+        """清理空闲连接以控制内存使用"""
+        import time
+        current_time = time.time()
+        connected_count = 0
+        idle_managers = []
+        
+        for name, mgr in self.managers.items():
+            if mgr._connected and mgr.client and mgr.client.is_connected():
+                connected_count += 1
+                # 超过空闲时间的连接
+                if current_time - mgr._last_activity > self.IDLE_TIMEOUT:
+                    idle_managers.append(mgr)
+        
+        # 如果连接数超过限制，断开最旧的空闲连接
+        if connected_count >= self.MAX_CONCURRENT_CONNECTIONS and idle_managers:
+            # 按最后活动时间排序，断开最旧的
+            idle_managers.sort(key=lambda m: m._last_activity)
+            for mgr in idle_managers[:max(1, connected_count - self.MAX_CONCURRENT_CONNECTIONS + 1)]:
+                await mgr.disconnect()
+    
+    async def disconnect_all(self):
+        """断开所有连接"""
+        for mgr in self.managers.values():
+            await mgr.disconnect()
+        print("[CONN] All connections closed")
+
+    async def get_joined_groups(self, account: str, only_groups: bool = True) -> List[dict]:
+        return await self.get(account).get_joined_groups(only_groups=only_groups)
+
+    async def inspect_group_send_capability(self, account: str) -> dict:
+        return await self.get(account).inspect_group_send_capability()
+
+    async def send_message_to_group(self, account: str, *args, **kwargs):
+        return await self.get(account).send_message_to_group(*args, **kwargs)
+
+    async def send_login_code(self, account: str, phone: str, force_sms: bool = False, force_new_session: bool = False):
+        return await self.get(account).send_login_code(phone, force_sms=force_sms, force_new_session=force_new_session)
+
+    async def validate_session(self, account: str) -> dict:
+        """验证账号的 session 文件是否有效"""
+        return await self.get(account).validate_session()
+
+    async def confirm_login(self, account: str, phone: str, code: str, password: str | None = None):
+        return await self.get(account).confirm_login(phone, code, password)
+
+    async def is_authorized(self, account: str) -> bool:
+        return await self.get(account).is_authorized()
+
+    async def join_group(self, account: str, invite_link: str, known_joined_ids: set | None = None) -> dict:
+        """通过邀请链接加入群组"""
+        return await self.get(account).join_group(invite_link, known_joined_ids)
+
+    async def update_profile(self, account: str, first_name: str, last_name: str = "", photo_path: str = None):
+        return await self.get(account).update_profile(first_name, last_name, photo_path)
+
+    async def get_profile(self, account: str) -> dict:
+        return await self.get(account).get_profile()
+
+    async def get_group_title(self, account: str, group_id: int) -> str:
+        return await self.get(account).get_group_title(group_id)
+
+    async def get_send_permission(self, account: str, group_id: int) -> str:
+        return await self.get(account).get_send_permission(group_id)
+
+    async def resolve_group_ref(self, account: str, ref) -> dict:
+        return await self.get(account).resolve_group_ref(ref)
+
+    async def update_text_profile(self, account: str, nickname: str, about: str | None = None):
+        return await self.get(account).update_text_profile(nickname, about)
+
+    async def refresh_account_client(self, account: str):
+        await self.get(account).reset_client()
+
+
+multi_manager = MultiTelegramManager(CONFIG.ACCOUNTS)

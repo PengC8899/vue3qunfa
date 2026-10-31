@@ -1,0 +1,38 @@
+# 实例 2 —— 对外端口 8002
+# 一套 sessions 目录、一套 SQLite 库、一个独立 compose 项目。
+# 硬约束：同一个账号的 session 文件只能出现在一个实例里，否则 Telegram 会判定 session 冲突。
+name: sessionqunfa_8002
+
+services:
+  web:
+    build: .
+    image: sessionqunfa-local:latest
+    container_name: tg-local-web-8002
+    ports:
+      - "8002:8000"
+    env_file:
+      - .env
+    environment:
+      - LOG_LEVEL=debug
+      - SESSION_DIR=/sessions
+      - DB_URL=sqlite:////app/data/data.db
+      # 预热轮间隔 5 分钟：60 分毕业线约 25 分钟出师。只影响预热这个只读流程。
+      - WARMUP_CYCLE_INTERVAL_S=300
+      # 一个群只要有一个账号就能发。默认值 2 会为了「备胎」把已经加过的群
+      # 再塞第二个账号，用户手动加完群后再点一键链路会看起来像重复加群。
+      - JOIN_ACCOUNTS_PER_GROUP=1
+      # 群发节奏：全池每小时目标条数（0 = 关闭自适应，退回预设里的固定冷却）。
+      # 自适应会把目标摊到每个群上：群池 ÷ 目标 = 每群冷却。
+      # 现在群池 300+，480 条/小时 → 每群约 39 分钟一次。
+      - LIVE_SEND_TARGET_PER_HOUR=480
+      # 同一个群就算换号也至少隔这么久才再发，避免两个号紧挨着连发同一个群。
+      # 想比 30 分钟更短，就把它一起调小。
+      - GROUP_MIN_GAP_S=1800
+      # 账号被 Telegram 限制群组发言（spam ban）后冻结多久再自动放回（秒）。
+      # 默认 24 小时；调小只会让被限制的号更早重试，限制没解除时会再次被判停。
+      - ACCOUNT_RESTRICT_COOLDOWN_S=86400
+    volumes:
+      - ./sessions-8002:/sessions
+      - ./data-8002:/app/data
+      - ./templates:/app/templates:ro
+    restart: unless-stopped
