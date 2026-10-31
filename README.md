@@ -1,224 +1,166 @@
-# Telegram 群发控制面板
+# TG 群发控制台
 
-使用 FastAPI + Telethon 构建的 Telegram 多账号群发控制后台，提供简单 Web 面板：选择群/频道、编辑消息、设定解析与间隔、后台异步发送与结果日志。
+Telegram 多账号加群 + 群发控制台：Starlette（`main.py`）+ Telethon + Vue 3（`frontend/`）+ SQLite。
 
-## 功能特性
+支持：批量导入 Session、账号健康检查、代理池（一号一代理）、群组池导入、按任务编号群发、
+「边加群边群发」常驻模式、运行日志页。
 
-- 多账号管理：通过 `.env` 配置多个账号，面板中切换使用
-- 群组/频道列表：可搜索、全选/取消、显示成员数与类型标记
-- 消息发送：支持 `plain`/`markdown`/`html` 三种解析；可关闭链接预览
-- 速率控制：每条可设置 `delay_ms`；内置短窗口去重与请求节流
-- 登录流程：在面板内发送验证码并确认登录；也提供 CLI 脚本
-- 异步发送：前端轮询任务状态；结果写入数据库并展示最近日志
-- Docker 部署：一键 `docker compose up -d`；可选 Caddy 反向代理启用 HTTPS
+---
 
-## 技术架构
+## 一台新机器部署（Docker，推荐）
 
-- 后端：`Starlette`/`FastAPI 风格` 路由（入口 `main.py`），`Telethon` 负责 Telegram 交互
-- 前端：Vue 3 + TypeScript + Pinia + Element Plus（源码在 `frontend/`，用 Vite 打包到 `static/dist/`）
-- 数据库：`SQLAlchemy` + SQLite（默认 `sqlite:///./data.db`），模型 `SendLog`
-- 会话：Telethon `.session` 文件位于 `SESSION_DIR`
-- 容器化：`Dockerfile` + `docker-compose.yml`；可选 `Caddyfile` 进行反向代理
+### 0. 前置
 
-## 目录结构（关键项）
+- 一台能访问 Telegram 的服务器 / 电脑
+- 已安装 Docker 与 Docker Compose v2（`docker compose version` 能正常输出）
 
-- `main.py`：Web 入口与所有 API 路由
-- `app/telegram_client.py`：Telegram 客户端与多账号管理
-- `app/services/*.py`：群列表与发送逻辑
-- `app/models.py`、`app/database.py`：数据库模型与连接
-- `frontend/`：前端源码（Vue3 + TS + Pinia + Element Plus），`npm run build` 产出到 `static/dist`
-- `templates/vue_index.html`：页面外壳，只负责加载 `/static/dist/app.js` 与 `app.css`
-- `Dockerfile`、`docker-compose.yml`、`Caddyfile`：容器与反向代理（Dockerfile 是多阶段构建，会在镜像里先跑前端打包）
+### 1. 拉代码
 
-## 快速开始（本地运行）
+```bash
+git clone https://github.com/PengC8899/vue3qunfa.git
+cd vue3qunfa
+```
+
+### 2. 配置 .env
+
+```bash
+cp .env.example .env
+```
+
+编辑 `.env`，**至少**把这三项换成真实值：
+
+```env
+ADMIN_TOKEN=自己设一个后台令牌
+TG_API_ID=你的api_id
+TG_API_HASH=你的api_hash
+```
+
+> `TG_API_ID` / `TG_API_HASH` 要和导入的 session 属于同一套应用（my.telegram.org 申请）。
+> 其它参数（时区、预热、节奏）都有默认值，可以先不动。
+
+### 3. 启动
+
+```bash
+docker compose up -d --build
+```
+
+首次构建会在镜像里自动打包前端（需要能访问 npm registry）。
+
+启动后打开：`http://<服务器IP>:8002`
+
+### 4. 首次使用顺序
+
+1. 输入 `.env` 里的 `ADMIN_TOKEN` 登录面板
+2. **账号管理** → 上传 `.session` 文件（支持多选 / zip 批量）
+3. **健康检查** → 开始检查，确认账号「可用」
+4. **代理 IP**（可选）→ 导入代理并批量测试；开启「一账号一代理」后，没代理的账号不会派活
+5. **全局控制台** → 目标群组池导入群链接（每行一个 `@xxx` / `https://t.me/xxx`）
+6. 在控制台保存一条群发任务拿到编号（例如 `#8`）
+7. 选好编号 → 点「边加群边群发」
+
+之后加群会优先加「还没有任何账号加入的群」，新加入的群在下一轮自动进入发送列表。
+
+### 5. 数据与备份
+
+| 路径 | 内容 |
+|---|---|
+| `data-8002/data.db` | SQLite 库：账号状态、群组池、任务、发送/加群日志 |
+| `sessions-8002/` | Telethon session 文件（敏感，别外传） |
+| `.env` | 令牌与 API 凭据（**没有**提交到仓库） |
+
+备份 = 打包这三个就行。迁移到新机器也是把这三样拷过去。
+
+### 6. 更新代码
+
+```bash
+git pull
+docker compose up -d --build
+```
+
+`data-8002`、`sessions-8002` 是挂载卷，重建容器不会丢数据；正在跑的常驻任务会自动恢复。
+
+---
+
+## 常用命令
+
+```bash
+docker compose ps                       # 容器状态
+docker logs -f tg-local-web-8002        # 实时日志
+docker compose restart                  # 只重启，不重建
+docker compose down                     # 停止并删除容器（数据仍在挂载目录）
+```
+
+---
+
+## `.env` 常用参数
+
+| 变量 | 默认 | 说明 |
+|---|---|---|
+| `ADMIN_TOKEN` | 无（必填） | 后台访问令牌 |
+| `TG_API_ID` / `TG_API_HASH` | 无（必填） | Telegram 应用凭据 |
+| `TIMEZONE` | `Asia/Singapore` | 日志与统计使用的时区 |
+| `LIVE_SEND_TARGET_PER_HOUR` | `480` | 全池每小时目标条数，决定每个群多久能再发；`0` 关闭自适应 |
+| `GROUP_MIN_GAP_S` | `1800` | 同一个群两次投递的最短间隔（换号也算） |
+| `ACCOUNT_RESTRICT_COOLDOWN_S` | `86400` | 账号被平台限制发言后冻结多久 |
+| `LIVE_JOIN_WORKERS` | `8` | 同时加群的账号数 |
+| `WARMUP_ENABLED` | `1` | 新导入账号先只读预热，毕业后才允许群发 |
+| `JOIN_ACCOUNTS_PER_GROUP` | compose 里设为 `1` | 每个群至少保留几个成员账号 |
+
+完整参数见 `app/config.py`（都支持同名环境变量）。
+
+---
+
+## 本地开发（不用 Docker）
 
 要求：Python 3.10+、Node.js 20+
 
 ```bash
-git clone <repo_url>
-cd project_root
-python -m venv venv
-source venv/bin/activate
+python -m venv venv && source venv/bin/activate
 pip install -r requirements.txt
 
-# 构建前端（产物输出到 static/dist，被 /static 静态目录直接提供）
 cd frontend && npm install && npm run build && cd ..
+cp .env.example .env        # 填 ADMIN_TOKEN / TG_API_ID / TG_API_HASH
 
-cp .env.example .env  # 若无示例，可参考下方配置说明
-# 编辑 .env（见下文），至少设置 ADMIN_TOKEN 与 TG_API_ID/TG_API_HASH/TG_SESSION_NAME
-uvicorn main:app --host 0.0.0.0 --port 8000
+SESSION_DIR=./sessions DB_URL=sqlite:///./data.db uvicorn main:app --port 8000
 ```
 
-前端开发模式（热更新，自动把 /api 代理到 8003）：
-
-```bash
-cd frontend && npm run dev
-```
-
-首次运行如账号未授权，面板会提示“未授权”，请在顶部登录区域完成验证码登录。
-
-## 配置说明（.env）
-
-最小配置（单账号）：
-
-```env
-# 后台管理员令牌（访问 API/面板时需要在 Header/页面输入）
-ADMIN_TOKEN=your_admin_token_here
-
-# Telegram 单账号配置
-TG_API_ID=123456
-TG_API_HASH=xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
-TG_SESSION_NAME=acc1
-
-# 服务器监听（可选）
-HOST=0.0.0.0
-PORT=8000
-
-# SQLite 数据库（本地默认写到项目根的 data.db）
-DB_URL=sqlite:///./data.db
-
-# Telethon 会话目录（默认当前目录），本地建议 `./sessions`
-SESSION_DIR=./sessions
-```
-
-多账号配置（示例）：
-
-```env
-ADMIN_TOKEN=your_admin_token_here
-
-# 声明账号列表（逗号分隔）
-TG_ACCOUNTS=acc1_vps,acc2,acc3
-
-# 每个账号提供独立的 API_ID/API_HASH/SESSION_NAME
-TG_acc1_vps_API_ID=111111
-TG_acc1_vps_API_HASH=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
-TG_acc1_vps_SESSION_NAME=acc1_vps
-
-TG_acc2_API_ID=222222
-TG_acc2_API_HASH=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
-TG_acc2_SESSION_NAME=acc2
-
-TG_acc3_API_ID=333333
-TG_acc3_API_HASH=cccccccccccccccccccccccccccccccc
-TG_acc3_SESSION_NAME=acc3
-
-# 数据库与会话目录（容器与本地可不同）
-DB_URL=sqlite:///./data.db
-SESSION_DIR=./sessions
-```
-
-Docker 部署时如需持久化数据库到挂载目录，建议设置：
-
-```env
-# 在 docker-compose 中默认挂载了 /app/data
-DB_URL=sqlite:////app/data/data.db
-SESSION_DIR=/sessions
-```
-
-## 登录与会话
-
-- 面板登录：在首页顶部输入手机号，点击“发送验证码”，随后输入验证码与（如有）二次密码，点击“确认登录”。
-- CLI 登录（可选）：
-
-```bash
-python login.py \
-  --api_id 123456 \
-  --api_hash xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx \
-  --session acc1 \
-  --phone +8613812345678 
-# 可加：--send_code_only 1 仅发送验证码；随后再次调用传入 --code 12345
-```
-
-会话文件位于 `SESSION_DIR` 下（如 `./sessions/acc1.session`）。
-
-## Docker 部署
-
-```bash
-# 构建并启动（后台运行）。前端由 Dockerfile 的多阶段构建自动打包，必须带 --build
-docker compose up -d --build
-
-# 查看容器状态
-docker ps
-
-# 查看日志
-docker logs -f tg-bulk-web
-docker logs -f tg-bulk-caddy
-```
-
-`docker-compose.yml` 要点：
-
-- `web` 服务映射端口 `8000:8000`，并设置 `SESSION_DIR=/sessions`；挂载 `./sessions:/sessions`、`./data:/app/data`
-- `caddy` 反向代理到 `web:8000`，开放 `80/443`；域名在 `Caddyfile` 中配置
-
-> 前端已经改成打包产物（`static/dist`），**不再有 `./static` 的 bind mount**。
-> 改完 `frontend/` 里的代码要重新 `docker compose up -d --build` 才会生效。
-> 构建阶段需要能访问 npm registry 与 `node:22-alpine` 镜像；离线机器请先在本地 `cd frontend && npm run build`，
-> 再把 `static/dist` 一起同步到服务器，并把 compose 里的 `web.build` 换成现成镜像。
-
-## 反向代理与 HTTPS（Caddy）
-
-示例 `Caddyfile`（参考仓库中的文件）：
-
-```
-你的域名.com, www.你的域名.com {
-    encode gzip
-    header {
-        Strict-Transport-Security "max-age=31536000; includeSubDomains; preload"
-    }
-    reverse_proxy web:8000
-}
-```
-
-将域名解析到服务器 IP 并确保开放 `80/443`，即可自动申请证书并通过 HTTPS 访问。
-
-## 使用指南（面板）
-
-- 输入并保存管理员令牌（顶部“管理员令牌”）
-- 选择账号（顶部下拉“账号”），必要时完成登录（验证码与二次密码）
-- 左侧“群组快选”中勾选需要发送的群组；支持搜索、全选/清空、刷新
-- 在“邀请任务”页编辑消息：选择解析模式 `plain/markdown/html`，设置间隔、轮数、轮次间隔，按需关闭链接预览
-- 发送：
-  - “发送到选中群组”创建单账号异步任务
-  - “已授权账号批量群发”按当前可用账号批量创建任务
-  - “测试发送”立即返回结果，不加入异步队列
-- 总览页可查看任务摘要、最近日志；健康检查页可逐账号检查可用性与群内发言能力
-
-## API 文档（需 Header：`X-Admin-Token: <ADMIN_TOKEN>`）
-
-- `GET /api/accounts` → 返回可用账号列表
-- `GET /api/groups?only_groups=true|false&account=<name>` → 返回群/频道列表
-- `GET /api/account-status?account=<name>` → 返回 `{ account, authorized }`
-- `POST /api/login/send-code` → `{"account","phone","force_sms"}`；返回 200 或 429（flood_wait）
-- `POST /api/login/confirm` → `{"account","phone","code","password"}`；成功返回 `{ ok: true, user }`
-- `POST /api/test-send` → 同步发送，返回 `{ total, success, failed }`
-- `POST /api/send-async` → 异步任务，返回 `{ task_id }`
-- `GET /api/task-status?task_id=...` → 返回任务进度 `{ total, success, failed, status }`
-- `GET /api/logs?limit=50` → 返回最近发送记录
-
-请求去重与节流：服务器在短窗口内对同一令牌做节流，并对重复 `request_id` 拦截（详见 `main.py:163`）。
-
-## 数据与日志
-
-- 数据库模型 `SendLog` 字段：`account_name`、`group_id`、`group_title`、`message_preview`、`status`、`error`、`created_at`
-- 状态值：`success` / `failed` / `skipped`（短时间内重复内容会跳过，详见发送服务逻辑）
-- 默认数据库为项目根的 `data.db`；生产环境建议将 `DB_URL` 指到容器挂载目录（如 `/app/data/data.db`）以持久化
-
-## 常见问题与排查
-
-- 401 Unauthorized：令牌错误或未设置，在页面顶部保存正确的 `ADMIN_TOKEN`
-- 403 session_not_authorized：账号尚未登录，完成验证码/二次密码登录后重试
-- 429 Too Many Requests：请求节流或重复 `request_id`；等待片刻再发
-- 429 flood_wait（发送验证码）：Telethon 触发频率限制，按提示秒数等待
-- 发送失败：可能目标不允许发言/账号受限/解析错误，详见最近日志中的 `error`
-- 无法持久化数据：确认 `DB_URL` 指向挂载目录（Docker 推荐 `sqlite:////app/data/data.db`）
-- 端口访问失败：在云防火墙中开放 `22/80/443/8000`
-
-## 安全与合规
-
-- 管理员令牌仅在本系统内部校验，请妥善保管并避免泄露
-- 请遵守 Telegram 使用条款，勿用于垃圾信息或骚扰行为
-- 对大量群发设置合理 `delay_ms`，避免账号被限制
+前端热更新：`cd frontend && npm run dev`（`/api` 默认代理到 `127.0.0.1:8003`，
+按需改 `frontend/vite.config.ts` 里的 `server.proxy`）。
 
 ---
 
-如需进一步定制（多会话并行、分布式发送、任务队列、角色权限、域名与证书自动化等），可在现有架构基础上扩展。
+## 目录结构
+
+```
+main.py                     所有 API 路由与「边加群边群发」调度
+app/telegram_client.py      Telethon 多账号客户端、发送与加群
+app/services/               加群、发送、代理、预热、Session 导入等
+app/models.py               数据表：tasks / send_logs / join_logs / target_groups ...
+frontend/                   Vue3 + TS + Pinia + Element Plus 源码
+templates/vue_index.html    页面外壳（加载 /static/dist/app.js）
+Dockerfile                  两阶段构建：先打包前端，再跑 Python
+docker-compose.yml          端口 8002，挂载 sessions-8002 / data-8002
+tests/                      后端测试（pytest）
+```
+
+---
+
+## 常见问题
+
+| 现象 | 原因 / 处理 |
+|---|---|
+| 启动即退出，日志 `Missing ADMIN_TOKEN` | `.env` 没配或没放在项目根目录 |
+| 面板 401 | 令牌填错，或在 `.env` 改完没重启容器 |
+| 账号显示「未授权」 | session 失效，需要重新导出上传；确认 `TG_API_ID/HASH` 与 session 同一套应用 |
+| 账号「被平台限制发言」 | Telegram 判了 spam ban，按 `ACCOUNT_RESTRICT_COOLDOWN_S` 冻结；到期自动恢复 |
+| 群发数为 0 | 看运行日志页/控制台详情：通常是预热未毕业、全部群在冷却、或账号都被限制 |
+| 页面还是旧版 | 改过 `frontend/` 必须 `docker compose up -d --build` 重新打包 |
+| 端口冲突 | 改 `docker-compose.yml` 里的 `"8002:8000"` 左侧端口 |
+| 外网访问不了 | 云安全组 / 防火墙放行对应端口 |
+
+---
+
+## 安全
+
+- `.env`、`sessions-*/`、`data-*/` 已在 `.gitignore` 中，**不要**提交到仓库
+- 群发请遵守 Telegram 使用条款，合理设置间隔；高频同文案最容易触发限制
